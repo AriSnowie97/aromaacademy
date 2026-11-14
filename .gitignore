@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.sqlite3
+.env
+media/videos/*.mp4
+media/videos/*.webm
+media/videos/*.mov
+!media/videos/README.txt
+.pytest_cache/
+

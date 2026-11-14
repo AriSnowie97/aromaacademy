@@ -1,0 +1,2 @@
+# Аромакадемія backend package
+
