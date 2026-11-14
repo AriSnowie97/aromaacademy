@@ -11,3 +11,4 @@ media/videos/*.mp4
 media/videos/*.webm
 media/videos/*.mov
 !media/videos/README.txt
+
