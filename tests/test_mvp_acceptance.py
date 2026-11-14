@@ -193,3 +193,87 @@ def test_6_admin_publish_updates_aroma_kb_and_markdown_import(client: TestClient
     source_ids = [s["lesson_id"] for s in ask.json()["sources"]]
     assert new_lesson_id in source_ids
 
+
+def test_7_aroma_remote_and_gemini_modes(client: TestClient, monkeypatch):
+    """Remote Aroma service mode and direct Gemini REST mode work while preserving safety gating."""
+    from backend.app import aroma_service
+
+    student_headers = _auth_header(client, "student-standard@aroma.ua")
+    captured: list[dict] = []
+
+    class _MockResp:
+        def __init__(self, status_code: int, payload: dict):
+            self.status_code = status_code
+            self._payload = payload
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def json(self):
+            return self._payload
+
+    def fake_post(url, **kwargs):
+        captured.append({"url": url, "kwargs": kwargs})
+        if "/v1/aroma/ask" in url:
+            return _MockResp(
+                200,
+                {
+                    "answer": "Привіт з віддаленої Ароми 🌸",
+                    "safety": {"triggered": False, "route_to": None, "reason": None},
+                },
+            )
+        return _MockResp(
+            200,
+            {
+                "candidates": [
+                    {"content": {"parts": [{"text": "**Арома**: Тепло з курсу 🌿"}]}}
+                ]
+            },
+        )
+
+    monkeypatch.setattr(aroma_service.httpx, "post", fake_post)
+    monkeypatch.setattr(aroma_service.settings, "aroma_service_mode", "remote")
+    monkeypatch.setattr(aroma_service.settings, "aroma_service_url", "https://bot.example.com")
+    monkeypatch.setattr(aroma_service.settings, "aroma_service_token", "secret-token")
+
+    # Safety red-flag must still stop BEFORE calling external HTTP service
+    safe_resp = client.post(
+        "/api/aroma/ask",
+        json={"message": "Яка доза олії безпечна при вагітності?"},
+        headers=student_headers,
+    )
+    assert safe_resp.status_code == 200
+    assert safe_resp.json()["safety"]["triggered"] is True
+    assert captured == []
+
+    # Normal query goes to remote /v1/aroma/ask with X-Service-Token & DB-derived tariff
+    remote_resp = client.post(
+        "/api/aroma/ask",
+        json={"lesson_id": "lesson_1_1", "message": "Що таке ефірні олії?"},
+        headers=student_headers,
+    )
+    assert remote_resp.status_code == 200
+    assert remote_resp.json()["answer"] == "Привіт з віддаленої Ароми 🌸"
+    assert len(captured) == 1
+    assert captured[0]["url"] == "https://bot.example.com/v1/aroma/ask"
+    assert captured[0]["kwargs"]["headers"]["X-Service-Token"] == "secret-token"
+    assert captured[0]["kwargs"]["json"]["tariff"] == "standard"
+
+    # Direct Gemini mode (without remote URL) strips ** markdown
+    captured.clear()
+    monkeypatch.setattr(aroma_service.settings, "aroma_service_mode", "gemini")
+    monkeypatch.setattr(aroma_service.settings, "aroma_service_url", "")
+    monkeypatch.setattr(aroma_service.settings, "gemini_api_key", "fake-gemini-key")
+
+    gem_resp = client.post(
+        "/api/aroma/ask",
+        json={"lesson_id": "lesson_1_1", "message": "Як використовувати лаванду?"},
+        headers=student_headers,
+    )
+    assert gem_resp.status_code == 200
+    assert gem_resp.json()["answer"] == "Арома: Тепло з курсу 🌿"
+    assert len(captured) == 1
+    assert "generativelanguage.googleapis.com" in captured[0]["url"]
+
+

@@ -1,10 +1,12 @@
 import hashlib
+import logging
 import math
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import httpx
 from sqlalchemy.orm import Session
 
 from .auth import get_allowed_tariffs
@@ -12,7 +14,16 @@ from .config import get_settings
 from .models import AromaMessage, Course, KbChunk, Lesson, Tariff, utcnow
 
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
+
+AROMA_SYSTEM_PROMPT = """Ти — Арома 🌸, турботлива цифрова помічниця Наталії Котелянської в освітньому застосунку «Аромакадемія».
+
+ПРАВИЛА РОБОТИ:
+1. Відповідай тепло, просто, грамотною українською мовою (або англійською, якщо користувач явно пише англійською), від першої особи жіночого роду («я підкажу», «я знайшла»). Без привітань у кожному повідомленні й без markdown-зірочок (`**`).
+2. Спирайся насамперед на надані фрагменти уроків (КОНТЕКСТ КУРСУ). Якщо в контексті курсу немає відповіді на запитання про курс, чесно скажи про це і запропонуй звернутися до Наталії Котелянської (https://www.instagram.com/nkotelianska/).
+3. КАТЕГОРИЧНО ЗАБОРОНЕНО ставити діагнози, призначати лікування, рекомендувати внутрішній прийом олій або давати дозування для вагітних, немовлят чи людей із хронічними хворобами — у таких випадках делікатно скеровуй до лікаря або до Наталії.
+4. Не вигадуй зміст недоступних учневі уроків. Будь стислою (3–6 речень або охайний список через емодзі 🌿 💧 ✨ 💛)."""
 
 # Safety state machine rules evaluated BEFORE any LLM/RAG call (Section 6 & 9).
 SAFETY_RULES: list[tuple[str, str, str]] = [
@@ -145,6 +156,171 @@ def get_remaining_daily_quota(db: Session, user_id: str, tariff_id: str) -> Opti
     return max(0, tariff.aroma_daily_limit - used)
 
 
+def _get_recent_history(
+    db: Session, user_id: str, lesson_id: Optional[str], limit: int = 6
+) -> list[dict[str, str]]:
+    """Return recent non-safety dialogue turns so Aroma preserves short-term context."""
+    q = db.query(AromaMessage).filter(
+        AromaMessage.user_id == user_id,
+        AromaMessage.safety_triggered.is_(False),
+    )
+    if lesson_id:
+        q = q.filter(AromaMessage.lesson_id == lesson_id)
+    rows = q.order_by(AromaMessage.created_at.desc()).limit(limit).all()
+    return [
+        {"role": "model" if m.role == "assistant" else "user", "text": m.text}
+        for m in reversed(rows)
+    ]
+
+
+def _collect_sources(top_matches: list[tuple[float, KbChunk]]) -> tuple[list[str], list[dict]]:
+    best_snippets: list[str] = []
+    seen_lessons: set[str] = set()
+    sources: list[dict] = []
+    for _, chunk in top_matches:
+        best_snippets.append(chunk.text)
+        if chunk.lesson_id not in seen_lessons:
+            seen_lessons.add(chunk.lesson_id)
+            sources.append(
+                {
+                    "lesson_id": chunk.lesson_id,
+                    "title": chunk.title,
+                    "source_ref": chunk.source_ref,
+                }
+            )
+    return best_snippets, sources
+
+
+def _call_remote_aroma(
+    user_id: str,
+    tariff_id: str,
+    lesson_id: Optional[str],
+    language: str,
+    message: str,
+    top_matches: list[tuple[float, KbChunk]],
+) -> Optional[dict]:
+    """Call external Aroma service endpoint POST /v1/aroma/ask if configured."""
+    base_url = (settings.aroma_service_url or "").strip().rstrip("/")
+    if not base_url:
+        return None
+    endpoint = base_url if base_url.endswith("/v1/aroma/ask") else f"{base_url}/v1/aroma/ask"
+    headers = {"Content-Type": "application/json"}
+    if settings.aroma_service_token:
+        headers["X-Service-Token"] = settings.aroma_service_token
+
+    payload = {
+        "user_id": user_id,
+        "tariff": tariff_id,
+        "lesson_id": lesson_id,
+        "language": language,
+        "message": message,
+        "lesson_context": [
+            {
+                "lesson_id": chunk.lesson_id,
+                "title": chunk.title,
+                "source_ref": chunk.source_ref,
+                "text": chunk.text,
+            }
+            for _, chunk in top_matches
+        ],
+    }
+    try:
+        resp = httpx.post(
+            endpoint,
+            json=payload,
+            headers=headers,
+            timeout=settings.aroma_timeout_seconds,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict) and isinstance(data.get("answer"), str) and data["answer"].strip():
+            return data
+    except Exception as exc:
+        logger.warning("Remote Aroma request failed: %s", exc)
+    return None
+
+
+def _call_gemini_aroma(
+    message: str,
+    language: str,
+    top_matches: list[tuple[float, KbChunk]],
+    history: list[dict[str, str]],
+) -> Optional[str]:
+    """Call Gemini generateContent REST API directly without extra SDK dependencies."""
+    api_key = (settings.gemini_api_key or "").strip()
+    if not api_key:
+        return None
+
+    context_lines = [
+        f"[{chunk.title or chunk.lesson_id} | {chunk.source_ref or 'курс'}]\n{chunk.text}"
+        for _, chunk in top_matches
+    ]
+    context_block = "\n\n---\n\n".join(context_lines) if context_lines else "Релевантних фрагментів у поточному тарифі не знайдено."
+    lang_note = "Відповідай англійською (English)." if language == "en" else "Відповідай виключно українською мовою."
+
+    contents: list[dict] = [
+        {"role": item["role"], "parts": [{"text": item["text"]}]}
+        for item in history
+    ]
+    contents.append(
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "text": (
+                        f"КОНТЕКСТ КУРСУ (відфільтровано за тарифом учня):\n{context_block}\n\n"
+                        f"МОВА ВІДПОВІДІ: {lang_note}\n\n"
+                        f"ЗАПИТАННЯ УЧНЯ:\n{message}"
+                    )
+                }
+            ],
+        }
+    )
+
+    body = {
+        "systemInstruction": {"parts": [{"text": AROMA_SYSTEM_PROMPT}]},
+        "contents": contents,
+        "generationConfig": {"temperature": 0.35, "maxOutputTokens": 900},
+    }
+
+    models = [m.strip() for m in (settings.gemini_model or "gemini-2.5-flash").split(",") if m.strip()]
+    for model in models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            resp = httpx.post(
+                url,
+                params={"key": api_key},
+                json=body,
+                timeout=settings.aroma_timeout_seconds,
+            )
+            if resp.status_code in (404, 429, 503):
+                logger.warning("Gemini model %s returned HTTP %s, trying fallback if any", model, resp.status_code)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            candidates = data.get("candidates") or []
+            if not candidates:
+                continue
+            parts = (candidates[0].get("content") or {}).get("parts") or []
+            text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+            if text:
+                return text.replace("**", "")
+        except Exception as exc:
+            logger.warning("Gemini request failed for model %s: %s", model, exc)
+    return None
+
+
+def _build_local_fallback_answer(best_snippets: list[str]) -> str:
+    if not best_snippets:
+        return (
+            "У доступних матеріалах вашого тарифу немає точної відповіді на це питання. "
+            "Рекомендую переглянути картки уроків або запитати Наталію."
+        )
+    if len(best_snippets) > 1:
+        return f"Ось що є в матеріалах курсу: {best_snippets[0]}\n\nДодатково: {best_snippets[1]}"
+    return f"За матеріалами курсу: {best_snippets[0]}"
+
+
 def process_aroma_ask(
     db: Session,
     user_id: str,
@@ -181,6 +357,9 @@ def process_aroma_ask(
             "ai_label": "Штучний інтелект Арома",
             "remaining_today": 0,
         }
+
+    # Capture recent history before adding the current user message
+    history = _get_recent_history(db, user_id, lesson_id)
 
     # Log user message minimally (avoid storing health details if safety triggers)
     triggered, reason_code, reason_desc = check_safety_state_machine(clean_msg)
@@ -280,33 +459,42 @@ def process_aroma_ask(
 
     scored.sort(key=lambda item: item[0], reverse=True)
     top_matches = [(s, c) for s, c in scored[:3] if s >= 0.14]
+    best_snippets, sources = _collect_sources(top_matches)
 
-    if not top_matches:
-        answer = (
-            "У доступних матеріалах вашого тарифу немає точної відповіді на це питання. "
-            "Рекомендую переглянути картки уроків або запитати Наталію."
+    mode = (settings.aroma_service_mode or "auto").strip().lower()
+    answer: Optional[str] = None
+    safety_info = {"triggered": False, "route_to": None, "reason": None}
+
+    if mode == "remote" or (mode == "auto" and (settings.aroma_service_url or "").strip()):
+        remote_data = _call_remote_aroma(
+            user_id=user_id,
+            tariff_id=tariff_id,
+            lesson_id=lesson_id,
+            language=language,
+            message=clean_msg,
+            top_matches=top_matches,
         )
-        sources = []
-    else:
-        best_snippets: list[str] = []
-        seen_lessons: set[str] = set()
-        sources = []
-        for _, chunk in top_matches:
-            best_snippets.append(chunk.text)
-            if chunk.lesson_id not in seen_lessons:
-                seen_lessons.add(chunk.lesson_id)
-                sources.append(
-                    {
-                        "lesson_id": chunk.lesson_id,
-                        "title": chunk.title,
-                        "source_ref": chunk.source_ref,
-                    }
-                )
-        lead_text = best_snippets[0]
-        if len(best_snippets) > 1:
-            answer = f"Ось що є в матеріалах курсу: {lead_text}\n\nДодатково: {best_snippets[1]}"
-        else:
-            answer = f"За матеріалами курсу: {lead_text}"
+        if remote_data:
+            answer = remote_data["answer"].strip()
+            remote_safety = remote_data.get("safety")
+            if isinstance(remote_safety, dict) and remote_safety.get("triggered"):
+                safety_info = {
+                    "triggered": True,
+                    "route_to": remote_safety.get("route_to") or "natalia_or_doctor",
+                    "reason": remote_safety.get("reason"),
+                }
+                sources = []
+
+    if answer is None and mode in ("gemini", "auto", "remote") and (settings.gemini_api_key or "").strip():
+        answer = _call_gemini_aroma(
+            message=clean_msg,
+            language=language,
+            top_matches=top_matches,
+            history=history,
+        )
+
+    if not answer:
+        answer = _build_local_fallback_answer(best_snippets)
 
     bot_msg = AromaMessage(
         id=f"amsg_{uuid.uuid4().hex[:12]}",
@@ -315,7 +503,8 @@ def process_aroma_ask(
         role="assistant",
         text=answer,
         sources=sources,
-        safety_triggered=False,
+        safety_triggered=bool(safety_info["triggered"]),
+        safety_reason=safety_info["reason"],
     )
     db.add(bot_msg)
     db.commit()
@@ -323,7 +512,7 @@ def process_aroma_ask(
     return {
         "answer": answer,
         "sources": sources,
-        "safety": {"triggered": False, "route_to": None, "reason": None},
+        "safety": safety_info,
         "disclaimer": True,
         "disclaimer_text": settings.disclaimer_text,
         "ai_label": "Штучний інтелект Арома",

@@ -19,8 +19,12 @@ class Settings(BaseSettings):
     secret_key: str = "dev-change-this-secret-key-in-production"
     webhook_secret: str = "dev-webhook-hmac-secret"
     token_ttl_seconds: int = 60 * 60 * 24 * 14  # 14 days
-    aroma_service_mode: str = "local"  # "local" or "remote"
+    aroma_service_mode: str = "auto"  # "auto", "local", "gemini", or "remote"
     aroma_service_url: str = ""
+    aroma_service_token: str = ""
+    aroma_timeout_seconds: float = 30.0
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
     media_dir: Path = BASE_DIR / "media"
     frontend_dir: Path = BASE_DIR / "frontend"
     consent_version: str = "2026-11-v1"
